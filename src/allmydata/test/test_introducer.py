@@ -2,11 +2,16 @@
 import os, re, itertools
 from base64 import b32decode
 import json
+from socket import socket, AF_INET
+from mock import Mock, patch
 
 from twisted.trial import unittest
 from twisted.internet import defer, address
 from twisted.python import log
 from twisted.python.filepath import FilePath
+from twisted.python.reflect import requireModule
+from twisted.internet.endpoints import AdoptedStreamServerEndpoint
+from twisted.internet.interfaces import IReactorSocket
 
 from foolscap.api import Tub, Referenceable, fireEventually, flushEventualQueue
 from twisted.application import service
@@ -16,12 +21,21 @@ from allmydata.introducer.server import IntroducerService, FurlFileConflictError
 from allmydata.introducer.common import get_tubid_string_from_ann, \
      get_tubid_string, sign_to_foolscap, unsign_from_foolscap, \
      UnknownKeyError
+from allmydata.node import (
+    create_node_dir,
+    read_config,
+)
 # the "new way" to create introducer node instance
 from allmydata.introducer.server import create_introducer
 from allmydata.web import introweb
-from allmydata.client import create_client
+from allmydata.client import (
+    create_client,
+    create_introducer_clients,
+)
 from allmydata.util import pollmixin, keyutil, idlib, fileutil, iputil, yamlutil
 import allmydata.test.common_util as testutil
+
+fcntl = requireModule("fcntl")
 
 class LoggingMultiService(service.MultiService):
     def log(self, msg, **kw):
@@ -34,13 +48,47 @@ class Node(testutil.SignalMixin, testutil.ReallyEqualMixin, unittest.TestCase):
         from allmydata.introducer import IntroducerNode
         IntroducerNode  # pyflakes
 
+    @defer.inlineCallbacks
+    def test_create(self):
+        """
+        A brand new introducer creates its config dir
+        """
+        basedir = "introducer.IntroducerNode.test_create"
+        yield create_introducer(basedir)
+        self.assertTrue(os.path.exists(basedir))
+
+    def test_introducer_clients_unloadable(self):
+        """
+        Error if introducers.yaml exists but we can't read it
+        """
+        basedir = u"introducer.IntroducerNode.test_introducer_clients_unloadable"
+        os.mkdir(basedir)
+        os.mkdir(os.path.join(basedir, u"private"))
+        yaml_fname = os.path.join(basedir, u"private", u"introducers.yaml")
+        with open(yaml_fname, 'w') as f:
+            f.write(u'---\n')
+        os.chmod(yaml_fname, 0o000)
+        self.addCleanup(lambda: os.chmod(yaml_fname, 0o700))
+        # just mocking the yaml failure, as "yamlutil.safe_load" only
+        # returns None on some platforms for unreadable files
+
+        with patch("allmydata.client.yamlutil") as p:
+            p.safe_load = Mock(return_value=None)
+
+            fake_tub = Mock()
+            config = read_config(basedir, "portnum")
+
+            with self.assertRaises(EnvironmentError):
+                create_introducer_clients(config, fake_tub)
+
+    @defer.inlineCallbacks
     def test_furl(self):
         basedir = "introducer.IntroducerNode.test_furl"
-        os.mkdir(basedir)
+        create_node_dir(basedir, "testing")
         public_fn = os.path.join(basedir, "introducer.furl")
         private_fn = os.path.join(basedir, "private", "introducer.furl")
 
-        q1 = create_introducer(basedir)
+        q1 = yield create_introducer(basedir)
         del q1
         # new nodes create unguessable furls in private/introducer.furl
         ifurl = fileutil.read(private_fn)
@@ -53,28 +101,29 @@ class Node(testutil.SignalMixin, testutil.ReallyEqualMixin, unittest.TestCase):
         fileutil.write(public_fn, guessable+"\n", mode="w") # text
 
         # if we see both files, throw an error
-        self.failUnlessRaises(FurlFileConflictError,
-                              create_introducer, basedir)
+        with self.assertRaises(FurlFileConflictError):
+            yield create_introducer(basedir)
 
         # when we see only the public one, move it to private/ and use
         # the existing furl instead of creating a new one
         os.unlink(private_fn)
 
-        q2 = create_introducer(basedir)
+        q2 = yield create_introducer(basedir)
         del q2
         self.failIf(os.path.exists(public_fn))
         ifurl2 = fileutil.read(private_fn)
         self.failUnless(ifurl2)
         self.failUnlessEqual(ifurl2.strip(), guessable)
 
+    @defer.inlineCallbacks
     def test_web_static(self):
         basedir = u"introducer.Node.test_web_static"
-        os.mkdir(basedir)
+        create_node_dir(basedir, "testing")
         fileutil.write(os.path.join(basedir, "tahoe.cfg"),
                        "[node]\n" +
                        "web.port = tcp:0:interface=127.0.0.1\n" +
                        "web.static = relative\n")
-        c = create_introducer(basedir)
+        c = yield create_introducer(basedir)
         w = c.getServiceNamed("webish")
         abs_basedir = fileutil.abspath_expanduser_unicode(basedir)
         expected = fileutil.abspath_expanduser_unicode(u"relative", abs_basedir)
@@ -314,6 +363,64 @@ class Server(unittest.TestCase):
 
 NICKNAME = u"n\u00EDickname-%s" # LATIN SMALL LETTER I WITH ACUTE
 
+def foolscapEndpointForPortNumber(portnum):
+    """
+    Create an endpoint that can be passed to ``Tub.listen``.
+
+    :param portnum: Either an integer port number indicating which TCP/IPv4
+        port number the endpoint should bind or ``None`` to automatically
+        allocate such a port number.
+
+    :return: A two-tuple of the integer port number allocated and a
+        Foolscap-compatible endpoint object.
+    """
+    if portnum is None:
+        # Bury this reactor import here to minimize the chances of it having
+        # the effect of installing the default reactor.
+        from twisted.internet import reactor
+        if fcntl is not None and IReactorSocket.providedBy(reactor):
+            # On POSIX we can take this very safe approach of binding the
+            # actual socket to an address.  Once the bind succeeds here, we're
+            # no longer subject to any future EADDRINUSE problems.
+            s = socket()
+            try:
+                s.bind(('', 0))
+                portnum = s.getsockname()[1]
+                s.listen(1)
+                fd = os.dup(s.fileno())
+                flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+                flags = flags | os.O_NONBLOCK | fcntl.FD_CLOEXEC
+                fcntl.fcntl(fd, fcntl.F_SETFD, flags)
+                return (
+                    portnum,
+                    AdoptedStreamServerEndpoint(reactor, fd, AF_INET),
+                )
+            finally:
+                s.close()
+        else:
+            # Get a random port number and fall through.  This is necessary on
+            # Windows where Twisted doesn't offer IReactorSocket.  This
+            # approach is error prone for the reasons described on
+            # https://tahoe-lafs.org/trac/tahoe-lafs/ticket/2787
+            portnum = iputil.allocate_tcp_port()
+    return (portnum, "tcp:%d" % (portnum,))
+
+def listenOnUnused(tub, portnum=None):
+    """
+    Start listening on an unused TCP port number with the given tub.
+
+    :param portnum: Either an integer port number indicating which TCP/IPv4
+        port number the endpoint should bind or ``None`` to automatically
+        allocate such a port number.
+
+    :return: An integer indicating the TCP port number on which the tub is now
+        listening.
+    """
+    portnum, endpoint = foolscapEndpointForPortNumber(portnum)
+    tub.listenOn(endpoint)
+    tub.setLocation("localhost:%d" % (portnum,))
+    return portnum
+
 class SystemTestMixin(ServiceMixin, pollmixin.PollMixin):
 
     def create_tub(self, portnum=None):
@@ -323,11 +430,7 @@ class SystemTestMixin(ServiceMixin, pollmixin.PollMixin):
         #tub.setOption("logRemoteFailures", True)
         tub.setOption("expose-remote-exception-types", False)
         tub.setServiceParent(self.parent)
-        if portnum is None:
-            portnum = iputil.allocate_tcp_port()
-        tub.listenOn("tcp:%d" % portnum)
-        self.central_portnum = portnum
-        tub.setLocation("localhost:%d" % self.central_portnum)
+        self.central_portnum = listenOnUnused(tub, portnum)
 
 class Queue(SystemTestMixin, unittest.TestCase):
     def test_queue_until_connected(self):
@@ -414,10 +517,7 @@ class SystemTest(SystemTestMixin, unittest.TestCase):
             #tub.setOption("logRemoteFailures", True)
             tub.setOption("expose-remote-exception-types", False)
             tub.setServiceParent(self.parent)
-            portnum = iputil.allocate_tcp_port()
-            tub.listenOn("tcp:%d" % portnum)
-            tub.setLocation("localhost:%d" % portnum)
-
+            listenOnUnused(tub)
             log.msg("creating client %d: %s" % (i, tub.getShortTubID()))
             c = IntroducerClient(tub, self.introducer_furl,
                                  NICKNAME % str(i),
@@ -746,7 +846,7 @@ class Announcements(unittest.TestCase):
         f.write("enabled = false\n")
         f.close()
 
-        c = create_client(basedir)
+        c = yield create_client(basedir)
         ic = c.introducer_clients[0]
         sk_s, vk_s = keyutil.make_keypair()
         sk, _ignored = keyutil.parse_privkey(sk_s)
@@ -814,13 +914,15 @@ class Announcements(unittest.TestCase):
         self.failUnlessEqual(announcements[pub2]["anonymous-storage-FURL"],
                              furl3)
 
-        c2 = create_client(basedir)
+        c2 = yield create_client(basedir)
         c2.introducer_clients[0]._load_announcements()
         yield flushEventualQueue()
         self.assertEqual(c2.storage_broker.get_all_serverids(),
                          frozenset([pub1, pub2]))
 
 class ClientSeqnums(unittest.TestCase):
+
+    @defer.inlineCallbacks
     def test_client(self):
         basedir = "introducer/ClientSeqnums/test_client"
         fileutil.make_dirs(basedir)
@@ -835,7 +937,7 @@ class ClientSeqnums(unittest.TestCase):
         f.write("enabled = false\n")
         f.close()
 
-        c = create_client(basedir)
+        c = yield create_client(basedir)
         ic = c.introducer_clients[0]
         outbound = ic._outbound_announcements
         published = ic._published_announcements
@@ -895,10 +997,7 @@ class NonV1Server(SystemTestMixin, unittest.TestCase):
         tub = Tub()
         tub.setOption("expose-remote-exception-types", False)
         tub.setServiceParent(self.parent)
-        portnum = iputil.allocate_tcp_port()
-        tub.listenOn("tcp:%d" % portnum)
-        tub.setLocation("localhost:%d" % portnum)
-
+        listenOnUnused(tub)
         c = IntroducerClient(tub, self.introducer_furl,
                              u"nickname-client", "version", "oldest", {},
                              fakeseq, FilePath(self.mktemp()))

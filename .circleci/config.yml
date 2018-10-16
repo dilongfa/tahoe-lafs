@@ -1,0 +1,373 @@
+# https://circleci.com/docs/2.0/
+
+version: 2
+workflows:
+  version: 2
+  ci:
+    jobs:
+      # Platforms
+      - "debian-9"
+      - "debian-8":
+          requires:
+            - "debian-9"
+
+      - "ubuntu-18.04"
+      - "ubuntu-16.04":
+          requires:
+            - "ubuntu-18.04"
+
+      - "fedora-28"
+      - "fedora-27":
+          requires:
+            - "fedora-28"
+
+      - "centos-7"
+
+      - "slackware-14.2"
+
+      # Other assorted tasks and configurations
+      - "lint"
+      - "deprecations"
+      - "c-locale"
+
+jobs:
+  lint:
+    docker:
+      - image: "circleci/python:2"
+
+    steps:
+      - "checkout"
+
+      - run:
+          name: "Install tox"
+          command: |
+            pip install --user tox
+
+      - run:
+          name: "Static-ish code checks"
+          command: |
+            ~/.local/bin/tox -e codechecks
+
+  debian-8: &DEBIAN
+    docker:
+      - image: "debian:8"
+
+    environment: &UTF_8_ENVIRONMENT
+      # Tell Hypothesis which configuration we want it to use.
+      TAHOE_LAFS_HYPOTHESIS_PROFILE: "ci"
+      # Tell the C runtime things about character encoding (mainly to do with
+      # filenames and argv).
+      LANG: "en_US.UTF-8"
+      # The package name for this software varies somewhat across distros.
+      EXTRA_PACKAGES: "virtualenv"
+      # Select a tox environment to run for this job.
+      TAHOE_LAFS_TOX_ENVIRONMENT: "coverage"
+      # Additional arguments to pass to tox.
+      TAHOE_LAFS_TOX_ARGS: ""
+      # Convince all of our pip invocations to look at the cached wheelhouse
+      # we maintain.
+      WHEELHOUSE_PATH: &WHEELHOUSE_PATH "/tmp/wheelhouse"
+      PIP_FIND_LINKS: "file:///tmp/wheelhouse"
+
+    steps:
+      - run: &INSTALL_GIT
+          name: "Install Git"
+          command: |
+            apt-get --quiet update
+            apt-get --quiet --yes install git
+
+      - "checkout"
+
+      - run: &BOOTSTRAP_TEST_ENVIRONMENT
+          name: "Bootstrap test environment"
+          command: |
+            ~/project/.circleci/bootstrap-test-environment.sh ~/project "${EXTRA_PACKAGES}"
+
+      - restore_cache: &RESTORE_HTTP_CACHE
+          name: "Restoring pip HTTP cache"
+          keys:
+            # An exact match on the http cache key is great.  It should have
+            # exactly the packages (tgz, whl, whatever) we need.
+            - v5-pip-http-{{ checksum "/tmp/project/setup.py" }}-{{ checksum "/tmp/project/src/allmydata/_auto_deps.py" }}
+            # A prefix match is okay too.  It might have a
+            # partially-overlapping set of packages.  That's a head-start, at
+            # least.  We might have to download a few more things but at least
+            # we saved a little time.  After we download some more stuff we'll
+            # create a new cache entry with the full key above and the next
+            # build will get a better cache hit.
+            - v5-pip-http-
+
+      - restore_cache: &RESTORE_WHEELHOUSE
+          name: "Restoring wheelhouse"
+          keys:
+            # As above, an exact match is great.  Here, we also need to
+            # include the job name to make sure the platform ABI matches.
+            # There are binary wheels in this wheelhouse and we're not taking
+            # care to make manylinux1 wheels.  The binary wheels in this cache
+            # will only work on some Linux distros.
+            - v4-wheelhouse-{{ .Environment.CIRCLE_JOB }}-{{ checksum "/tmp/project/setup.py" }}-{{ checksum "/tmp/project/src/allmydata/_auto_deps.py" }}
+            # A partial match is okay too.  It'll get us at least some of the
+            # wheels.  We do need to keep the job name as part of the key or
+            # we might get binary wheels build against an incompatible ABI and
+            # we won't be able to use them (and they'll break the build rather
+            # than being ignored).
+            - v4-wheelhouse-{{ .Environment.CIRCLE_JOB }}
+
+      - run: &SETUP_VIRTUALENV
+          name: "Setup virtualenv"
+          # pip cannot install packages if the working directory is not
+          # readable.
+          working_directory: "/tmp"
+          command: |
+            /tmp/project/.circleci/setup-virtualenv.sh \
+                "${TAHOE_LAFS_TOX_ENVIRONMENT}" \
+                "${TAHOE_LAFS_TOX_ARGS}"
+
+      - save_cache: &SAVE_HTTP_CACHE
+          name: "Saving pip HTTP cache"
+          key: v5-pip-http-{{ checksum "/tmp/project/setup.py" }}-{{ checksum "/tmp/project/src/allmydata/_auto_deps.py" }}
+          paths:
+            # Perfectly valid for Linux.  Note we exclude the wheel cache
+            # because we want this cache to be valid across all platforms and
+            # the wheels in the pip wheel cache are not necessarily so.
+            - "/tmp/nobody/.cache/pip/http"
+
+      - save_cache: &SAVE_WHEELHOUSE
+          name: "Caching wheelhouse"
+          key: v4-wheelhouse-{{ .Environment.CIRCLE_JOB }}-{{ checksum "/tmp/project/setup.py" }}-{{ checksum "/tmp/project/src/allmydata/_auto_deps.py" }}
+          paths:
+            - *WHEELHOUSE_PATH
+
+      - run: &RUN_TESTS
+          name: "Run test suite"
+          # Something about when it re-uses an existing environment blows up
+          # if the working directory is not readable.
+          working_directory: "/tmp"
+          command: |
+            /tmp/project/.circleci/run-tests.sh \
+                /tmp/artifacts \
+                "${TAHOE_LAFS_TOX_ENVIRONMENT}" \
+                "${TAHOE_LAFS_TOX_ARGS}"
+          # trial output gets directed straight to a log.  avoid the circleci
+          # timeout while the test suite runs.
+          no_output_timeout: "20m"
+
+      - store_test_results: &STORE_TEST_RESULTS
+          path: "/tmp/artifacts/junit"
+
+      - store_artifacts: &STORE_TEST_LOG
+          # Despite passing --workdir /tmp to tox above, it still runs trial
+          # in the project source checkout.
+          path: "/tmp/project/_trial_temp/test.log"
+
+      - store_artifacts: &STORE_OTHER_ARTIFACTS
+          # Store any other artifacts, too.  This is handy to allow other jobs
+          # sharing most of the definition of this one to be able to
+          # contribute artifacts easily.
+          path: "/tmp/artifacts"
+
+      - run: &SUBMIT_COVERAGE
+          name: "Submit coverage results"
+          working_directory: "/tmp/project"
+          command: |
+            /tmp/tests/bin/codecov
+
+
+  debian-9:
+    <<: *DEBIAN
+    docker:
+      - image: "debian:9"
+
+
+  c-locale:
+    <<: *DEBIAN
+    docker:
+      - image: "debian:9"
+
+    environment:
+      <<: *UTF_8_ENVIRONMENT
+      LANG: "C"
+
+
+  deprecations:
+    <<: *DEBIAN
+    docker:
+      - image: "debian:9"
+
+    environment:
+      <<: *UTF_8_ENVIRONMENT
+      # Select the deprecations tox environments.
+      TAHOE_LAFS_TOX_ENVIRONMENT: "deprecations,upcoming-deprecations"
+      # Put the logs somewhere we can report them.
+      TAHOE_LAFS_WARNINGS_LOG: "/tmp/artifacts/deprecation-warnings.log"
+
+
+  ubuntu-16.04:
+    <<: *DEBIAN
+    docker:
+      - image: "ubuntu:16.04"
+
+    environment:
+      <<: *UTF_8_ENVIRONMENT
+      # Necessary for en_US LANG setting.
+      EXTRA_PACKAGES: "virtualenv language-pack-en"
+
+
+  ubuntu-18.04:
+    <<: *DEBIAN
+    docker:
+      - image: "ubuntu:18.04"
+
+    environment:
+      <<: *UTF_8_ENVIRONMENT
+      # Necessary for automatic address detection/assignment.
+      EXTRA_PACKAGES: "virtualenv iproute2"
+
+
+  centos-7: &RHEL_DERIV
+    docker:
+      - image: "centos:7"
+
+    environment: *UTF_8_ENVIRONMENT
+
+    steps:
+      - run:
+          name: "Install Git"
+          command: |
+            yum install --assumeyes git
+
+      - "checkout"
+
+      - run:
+          name: "Bootstrap test environment"
+          working_directory: "/tmp"
+          command: |
+            # Avoid the /nonexistent home directory in nobody's /etc/passwd
+            # entry.
+            usermod --home /tmp/nobody nobody
+
+            # Grant read access to nobody, the user which will eventually try
+            # to test this checkout.
+            mv /root/project /tmp/project
+
+            # Python build/install toolchain wants to write to the source
+            # checkout, too.
+            chown --recursive nobody:nobody /tmp/project
+
+            yum install --assumeyes \
+                sudo \
+                make automake gcc gcc-c++ \
+                python \
+                python-devel \
+                libffi-devel \
+                openssl-devel \
+                libyaml-devel \
+                python-virtualenv
+
+            # XXX net-tools is actually a Tahoe-LAFS runtime dependency!
+            yum install --assumeyes \
+                net-tools
+
+      - restore_cache: *RESTORE_HTTP_CACHE
+      - restore_cache: *RESTORE_WHEELHOUSE
+
+      - run: *SETUP_VIRTUALENV
+
+      - save_cache: *SAVE_HTTP_CACHE
+      - save_cache: *SAVE_WHEELHOUSE
+
+      - run: *RUN_TESTS
+
+      - store_test_results: *STORE_TEST_RESULTS
+      - store_artifacts: *STORE_TEST_LOG
+      - store_artifacts: *STORE_OTHER_ARTIFACTS
+      - run: *SUBMIT_COVERAGE
+
+
+  fedora-27:
+    <<: *RHEL_DERIV
+    docker:
+      - image: "fedora:27"
+
+
+  fedora-28:
+    <<: *RHEL_DERIV
+    docker:
+      - image: "fedora"
+
+
+  slackware-14.2:
+    docker:
+      - image: "vbatts/slackware:14.2"
+
+    environment: *UTF_8_ENVIRONMENT
+
+    steps:
+      - run:
+          name: "Install Git"
+          command: |
+            slackpkg update
+            slackpkg install openssh-7.4p1 git-2.14.4 </dev/null
+
+      - "checkout"
+
+      - run:
+          name: "Bootstrap test environment"
+          working_directory: "/tmp"
+          command: |
+            # Avoid the /nonexistent home directory in nobody's /etc/passwd
+            # entry.
+            usermod --home /tmp/nobody nobody
+
+            # Grant read access to nobody, the user which will eventually try
+            # to test this checkout.
+            mv /root/project /tmp/project
+
+            # Python build/install toolchain wants to write to the source
+            # checkout, too.
+            chown --recursive nobody:nobody /tmp/project
+
+            slackpkg install \
+                ca-certificates \
+                sudo-1 \
+                make-4 \
+                automake-1 \
+                kernel-headers \
+                glibc-2 \
+                binutils-2 \
+                gcc-5 \
+                gcc-g++-5 \
+                python-2 \
+                libffi-3 \
+                libyaml-0 \
+                sqlite-3 \
+                icu4c-56 \
+                libmpc-1 </dev/null
+
+            slackpkg upgrade \
+                openssl-1 </dev/null
+
+            # neither virtualenv nor pip is packaged.
+            # do it the hard way.
+            # and it is extra hard since it is slackware.
+            slackpkg install \
+                cyrus-sasl-2 \
+                curl-7 </dev/null
+            curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python get-pip.py
+            pip install virtualenv
+
+      - restore_cache: *RESTORE_HTTP_CACHE
+      - restore_cache: *RESTORE_WHEELHOUSE
+
+      - run: *SETUP_VIRTUALENV
+
+      - save_cache: *SAVE_HTTP_CACHE
+      - save_cache: *SAVE_WHEELHOUSE
+
+      - run: *RUN_TESTS
+
+      - store_test_results: *STORE_TEST_RESULTS
+      - store_artifacts: *STORE_TEST_LOG
+      - store_artifacts: *STORE_OTHER_ARTIFACTS
+      - run: *SUBMIT_COVERAGE
